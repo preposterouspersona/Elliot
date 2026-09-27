@@ -1,174 +1,194 @@
 import os
+import json
 from dotenv import load_dotenv
-from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langgraph.graph import StateGraph,START,END
+from langgraph.graph import StateGraph, START, END
 
-
-from ..models.schema import AgentState, JudgeSchema
-from ..utils.db import DatabaseUtil
+from models.schema import AgentState
+from utils.db import DatabaseUtil
 
 load_dotenv()
 
-lower = os.getenv("LOWER_LLM")
-higher = os.getenv("HIGHER_LLM")
+lower = os.getenv("LLM_LOWER", "llama-3.1-8b-instant")
+higher = os.getenv("LLM_HIGHER", "llama-3.3-70b-versatile")
 groq_api_key = os.getenv("GROQ_API_KEY")
 
 
-## --- TOOLS -- ##
+def get_db_connection_details(state: AgentState) -> dict:
+    """Helper to retrieve DB credentials from state or fallback to .env."""
+    if hasattr(state, "db_config") and state.db_config and any(state.db_config.values()):
+        return state.db_config
+    return {
+        "dbname": os.getenv("database") or os.getenv("dbname") or "postgres",
+        "host": os.getenv("host", "localhost"),
+        "user": os.getenv("user", "postgres"),
+        "password": os.getenv("password", ""),
+        "port": int(os.getenv("port", 5432)),
+    }
 
-@tool
+
+# --- NODES --- #
+
 def curate_question(state: AgentState) -> AgentState:
-    """This tool refines the user prompt to a well-structured question"""
+    """Refines user prompt to a well-structured question."""
     user_prompt = state.user_prompt
-
-    llm = ChatGroq(model=lower, api_key=groq_api_key)
+    llm = ChatGroq(model=lower, api_key=groq_api_key, max_retries=3)
 
     messages = [
         SystemMessage(content="Curate and refine user prompt to a well defined question."),
         HumanMessage(content=user_prompt)
     ]
 
-    result = llm.invoke(messages)
+    try:
+        result = llm.invoke(messages)
+        curated_text = result.content
+    except Exception:
+        curated_text = user_prompt
 
-    state.curated_query = result.content
-    state.messages = [HumanMessage(content=result.content)]
+    state.curated_query = curated_text
+    state.messages = [HumanMessage(content=curated_text)]
     return state
 
 
-@tool
 def add_context(state: AgentState) -> AgentState:
-    """This tool adds database context to the refined user prompt, and provides a system prompt for SQL generation"""
+    """Adds database context to the prompt."""
+    connection_details = get_db_connection_details(state)
 
-    connection_details = {
-        "dbname": os.getenv("database"),
-        "host": os.getenv("host"),
-        "user": os.getenv("user"),
-        "password": os.getenv("password"),
-        "port": int(os.getenv("port", 5432)),
-    }
+    try:
+        db_obj = DatabaseUtil(connection_details)
+        context = db_obj.schema_details("public")
+    except Exception as e:
+        context = f"Unable to fetch schema details: {str(e)}"
 
-    db_obj = DatabaseUtil(connection_details)
-    context = db_obj.schema_details("public")
-
-    curated_prompt = state.curated_query
+    curated_prompt = state.curated_query or state.user_prompt
 
     prompt = f"""
-            You are a helpful AI assistant. Your job is to generate a single SQL query and no extra content from
-            user's natural language input, which is to be executed on a Postgres SQL database directly.
-            You will be provided all the database schema details such as table names, column names, data types and
-            sample data.
-            The output should be a single SQL ready-to-be-executed query, no modifications must be made to it while executing
-            the query.
-            Unless user specifies the no of rows, limit it to 10 to reduce overhead.
+    You are an AI PostgreSQL expert. Your job is to generate a single valid, ready-to-execute SQL query for a PostgreSQL database.
 
-            User's query = {curated_prompt}
-            database schema details = {context}
+    User's Query: {curated_prompt}
+    Database Schema Context: {context}
+
+    INSTRUCTIONS:
+    1. If the user asks for schema info, table details, column names, data types, OR row counts, write a valid PostgreSQL query to retrieve that exact information (e.g., querying `information_schema.columns` or using `SELECT COUNT(*) FROM <table_name>`).
+    2. Do NOT output explanations or markdown commentary outside of standard ```sql ``` code blocks.
+    3. Output ONLY a single SQL query ready for execution.
     """
 
     state.prompt_context_sql = prompt
     return state
 
 
-@tool
 def generate_sql_query(state: AgentState) -> AgentState:
-    """This tool generates sql query with database schema details, user's query as context"""
-    llm = ChatGroq(model=higher, api_key=groq_api_key)
+    """Generates SQL query with DB schema context."""
+    llm = ChatGroq(model=higher, api_key=groq_api_key, max_retries=3)
 
-    prompt = state.prompt_context_sql  # our context. Contains user query, db schema details and system prompt
-    result = llm.invoke(prompt).content
+    prompt = state.prompt_context_sql
+    try:
+        result = llm.invoke(prompt).content
+        if "```sql" in result:
+            result = result.split("```sql")[1].split("```")[0].strip()
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0].strip()
+    except Exception:
+        result = "-- Error generating SQL query."
 
     state.generated_sql_query = result
-
     return state
 
 
-@tool
 def check_safety(state: AgentState) -> AgentState:
-    """This tool checks wether the generated SQL query is safe to execute."""
-    llm = ChatGroq(model=higher, api_key=groq_api_key)
-    llm_as_judge = llm.with_structured_output(JudgeSchema)
-
-    sql_query = state.generated_sql_query
+    """Evaluates SQL query safety using Groq JSON mode (no tool calls)."""
+    # Force native JSON mode to eliminate tool_choice errors
+    llm = ChatGroq(
+        model=higher, 
+        api_key=groq_api_key, 
+        max_retries=3,
+        model_kwargs={"response_format": {"type": "json_object"}}
+    )
 
     prompt = f"""
-    You are an SQL Judge for data security. Your task is to determine whether the SQL query is 
-    safe or not. The SQL query should only be used for data retrieval and should not modify the 
-    database in any way. Neither the SQL query nor the prompt should contain any SQL commands that can modify the
-    database, such as INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, or any other commands that can change
-    the structure or content of the database. If the SQL query is safe, respond with 'YES' otherwise respond with 
-    'NO'. Additionally, provide comments explaining your decision.
-    Here's the SQL query to evaluate:
-    {sql_query}"""
+    You are an SQL Safety Judge. Evaluate if the following SQL query is safe (read-only / data retrieval ONLY).
+    A query is UNSAFE if it contains any data modification or schema alteration commands (e.g. INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE).
 
-    result = llm_as_judge.invoke(prompt)
+    Query to evaluate:
+    {state.generated_sql_query}
 
-    state.is_safe = (result.answer == "YES")
-    state.comments = result.justification
+    Respond ONLY with a valid JSON object matching this exact structure:
+    {{
+        "answer": "YES",
+        "justification": "Detailed explanation here"
+    }}
+    """
+
+    try:
+        raw_response = llm.invoke(prompt).content.strip()
+        data = json.loads(raw_response)
+        ans = str(data.get("answer", "")).strip().upper()
+
+        state.is_safe = (ans == "YES")
+        state.comments = data.get("justification", "No justification provided.")
+
+    except Exception as e:
+        query_lower = (state.generated_sql_query or "").lower()
+        dangerous_keywords = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "revoke"]
+        state.is_safe = not any(kw in query_lower for kw in dangerous_keywords)
+        state.comments = f"Rule-based safety check applied. (Detail: {str(e)})"
+
     return state
 
 
-@tool
 def cancel_sql(state: AgentState) -> AgentState:
-    """This tool is fallback if the geenrated SQL query is deemed unsafe."""
+    """Fallback if SQL is unsafe."""
     comments = state.comments
-
-    state.final_answer = f"Your query was deemed unsafe by our internal software and cannot be executed. The reason being:{comments}\nPlease try again with another query"
-
+    state.final_answer = f"Your query was deemed unsafe and cannot be executed. Reason: {comments}"
     state.messages = [AIMessage(content=state.final_answer)]
-
     return state
 
 
-@tool
 def execute_sql(state: AgentState) -> AgentState:
-    """This tool executes the generated SQL query if it is deemed safe."""
+    """Executes safe SQL query."""
     sql_query = state.generated_sql_query
+    connection_details = get_db_connection_details(state)
 
-    connection_details = {
-        "dbname": os.getenv("database"),
-        "host": os.getenv("host"),
-        "user": os.getenv("user"),
-        "password": os.getenv("password"),
-        "port": int(os.getenv("port", 5432)),
-    }
-
-    db_obj = DatabaseUtil(connection_details)
-    result = db_obj.execute_sql(sql_query)
+    try:
+        db_obj = DatabaseUtil(connection_details)
+        result = db_obj.execute_sql(sql_query)
+    except Exception as e:
+        result = f"Error executing SQL: {str(e)}"
 
     state.sql_result = result
     return state
 
 
-@tool
 def generate_answer(state: AgentState) -> AgentState:
-    """This tool provides an answer to the user at the end"""
-    curated_prompt = state.curated_query
+    """Synthesizes final answer for SQL queries."""
+    curated_prompt = state.curated_query or state.user_prompt
     sql_answer = state.sql_result
 
-    llm = ChatGroq(model=lower, api_key=groq_api_key)
+    llm = ChatGroq(model=lower, api_key=groq_api_key, max_retries=3)
 
     prompt = f"""
-    You are an SQL analyst agent. Your task is to provide a final answer to the user based on the
-    execution result of the SQL query and the user's original question. The final answer should be
-    concise, clear, and directly address the user's query. Avoid including any SQL code or technical
-    details in the final answer. The final answer should be in a user-friendly format that is easy to
-    understand. If the execution result is empty or does not provide a clear answer to the user's question, explain this in the final answer. \n
-    Here is the execution result: {sql_answer} \n
-    Here is the user's original question: {curated_prompt}
+    You are an SQL analyst agent. Provide a final answer to the user based on the execution result of the SQL query.
+    Make it concise, clear, and directly address the user's query. Avoid technical jargon or raw SQL in the final output.
+
+    Execution result: {sql_answer}
+    User question: {curated_prompt}
     """
 
-    result = llm.invoke(prompt).content
+    try:
+        result = llm.invoke(prompt).content
+    except Exception:
+        result = f"Query executed successfully. Result:\n{sql_answer}"
 
     state.final_answer = result
     state.messages = [AIMessage(content=result)]
-
     return state
 
 
-#-------------------------------GRAPH------------------------------#
-darlene_graph  = StateGraph(AgentState)
+# --- GRAPH --- #
+
+darlene_graph = StateGraph(AgentState)
 
 darlene_graph.add_node("curate_question", curate_question)
 darlene_graph.add_node("add_context", add_context)
@@ -178,28 +198,27 @@ darlene_graph.add_node("cancel_sql", cancel_sql)
 darlene_graph.add_node("execute_sql", execute_sql)
 darlene_graph.add_node("generate_answer", generate_answer)
 
-
 darlene_graph.add_edge(START, "curate_question")
 darlene_graph.add_edge("curate_question", "add_context")
-darlene_graph.add_edge("add_context","generate_sql_query")
-darlene_graph.add_edge("generate_sql_query","check_safety")
+darlene_graph.add_edge("add_context", "generate_sql_query")
+darlene_graph.add_edge("generate_sql_query", "check_safety")
 
-def safety_router(state: AgentState) :
+
+def safety_router(state: AgentState):
     return state.is_safe
+
 
 darlene_graph.add_conditional_edges(
     "check_safety",
     safety_router,
     {
-        True:"execute_sql",
-        False :"cancel_sql"
+        True: "execute_sql",
+        False: "cancel_sql"
     }
-
 )
 
-darlene_graph.add_edge("generate_answer", END)
 darlene_graph.add_edge("execute_sql", "generate_answer")
+darlene_graph.add_edge("generate_answer", END)
 darlene_graph.add_edge("cancel_sql", END)
 
-
-darlene=darlene_graph.compile()
+darlene = darlene_graph.compile()
